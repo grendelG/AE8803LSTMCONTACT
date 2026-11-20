@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+torch>=2.2          # CPU build is fine
+gtsam>=4.2          # same library as Project 2b
+rosbags>=0.9        # only needed for code/extract.py (reading the .bag files)

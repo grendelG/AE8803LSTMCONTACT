@@ -1,0 +1,31 @@
+heuristic params {'tau': 0.3, 'a': 1.0, 'T': 0.03, 'b': 0.75}
+  mlp ep0 val_mse 0.0386 (15s)
+  mlp ep1 val_mse 0.0387 (13s)
+  mlp ep2 val_mse 0.0398 (15s)
+  mlp ep3 val_mse 0.0395 (13s)
+  mlp ep4 val_mse 0.0397 (16s)
+  mlp ep5 val_mse 0.0389 (13s)
+  mlp ep6 val_mse 0.0400 (17s)
+  mlp ep7 val_mse 0.0397 (16s)
+  mlp ep8 val_mse 0.0401 (15s)
+  mlp ep9 val_mse 0.0394 (12s)
+  mlp ep10 val_mse 0.0396 (14s)
+  mlp ep11 val_mse 0.0402 (14s)
+  lstm ep0 val_mse 0.0377 (100s)
+  lstm ep1 val_mse 0.0383 (13s)
+  lstm ep2 val_mse 0.0413 (13s)
+  lstm ep3 val_mse 0.0416 (12s)
+  lstm ep4 val_mse 0.0435 (12s)
+  lstm ep5 val_mse 0.0452 (15s)
+  lstm ep6 val_mse 0.0448 (19s)
+  lstm ep7 val_mse 0.0454 (81s)
+  lstm ep8 val_mse 0.0449 (60s)
+  lstm ep9 val_mse 0.0469 (13s)
+  lstm ep10 val_mse 0.0451 (12s)
+  lstm ep11 val_mse 0.0483 (13s)
+building {'heuristic': (0.15, 0.3), 'mlp': (0.149, 0.392), 'lstm': (0.15, 0.461)}
+under {'heuristic': (0.118, 0.462), 'mlp': (0.108, 0.511), 'lstm': (0.104, 0.532)}
+garage {'heuristic': (0.197, 0.168), 'mlp': (0.191, 0.2), 'lstm': (0.185, 0.273)}
+narrow {'heuristic': (0.178, 0.068), 'mlp': (0.178, 0.138), 'lstm': (0.177, 0.22)}
+stair {'heuristic': (0.153, 0.331), 'mlp': (0.146, 0.434), 'lstm': (0.144, 0.461)}
+trail {'heuristic': (0.166, 0.267), 'mlp': (0.159, 0.374), 'lstm': (0.157, 0.41)}

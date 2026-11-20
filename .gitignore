@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+# regenerated in seconds by the pipeline
+features/
+features_synth/
+results/scores/
+results/scores_synth/
+results/ekf_*/traj/
+results/ekf_synth/
+# raw bags are ~1-1.4 GB each; download from the Co-RaL Google Drive
+*.bag
