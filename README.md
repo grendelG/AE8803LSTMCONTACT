@@ -11,19 +11,25 @@ We compare four ways of getting the score: none (original EKF), a hand-tuned heu
 
 ## TL;DR
 
-| | stair | trail |
+| Label prediction on test (correlation r) | stair | trail |
 |---|---|---|
-| **Label prediction** (correlation with true label): Heuristic / MLP / **LSTM-MLP** | 0.33 / 0.43 / **0.46** | 0.27 / 0.37 / **0.41** |
+| A: real labels: Heuristic / MLP / **LSTM-MLP** | 0.24 / 0.36 / **0.47** | 0.22 / 0.26 / **0.36** |
+| B: synthetic slips: Heuristic / MLP / **LSTM-MLP** | 0.25 / 0.90 / **0.95** | 0.26 / 0.89 / **0.96** |
 
-| Test mean (stair + trail) | ATE [m] | RPE per 10 m [m] | Drift [%] |
+| Test mean (stair + trail) | A: real data, RPE /10 m [m] | B: synthetic slips, slip damage [m] | B: RPE /10 m [m] |
 |---|---|---|---|
-| Original EKF | 1.53 ± 0.39 | 0.753 | 2.44 |
-| Heuristic / MLP / LSTM-MLP | 1.53 ± 0.39 | 0.753 | 2.44–2.45 |
-| Oracle (true labels fed in) | 1.52 ± 0.39 | 0.753 | 2.43 |
+| Original EKF (Project 2b replay) | 0.753 | 2.58 | 0.887 |
+| EKF, continuous updates | **0.305** | 3.21 | 0.610 |
+| + Heuristic | 0.307 | 2.38 | 0.537 |
+| + MLP | 0.305 | **0.62** | **0.343** |
+| + LSTM-MLP | **0.304** | 0.63 | **0.343** |
+| + Oracle (true labels) | 0.306 | 0.61 | 0.345 |
 
-- The **LSTM-MLP predicts the reliability labels best**, as hypothesized.
-- **None of the methods changes the EKF's accuracy, not even perfect labels.** The labels derived from LiDAR odometry are mostly reference noise, and the EKF's error is dominated by heading drift, which foot reliability cannot fix. Details in [Results](#7-results-and-what-they-mean).
-- The proposal's fallback experiment (synthetic slips) is designed and coded but **not finished**. See [§8](#8-unfinished-synthetic-slip-experiment).
+- The **LSTM-MLP predicts the reliability labels best** in both experiments, as hypothesized.
+- **Real data:** foot reliability does not change the EKF, not even perfect labels. Spot barely slips on these recordings; what error is left is mostly heading drift.
+- **Synthetic slips:** learned reliability removes **~80% of the slip damage** and matches the oracle. MLP and LSTM end up equal here, since both are good enough.
+- Running the EKF with **continuous foot updates** instead of touchdown-only cut the real-data error per 10 m by 2.5× (0.75 → 0.31 m).
+- Full story in [§7](#7-results-and-what-they-mean); what changed since the first version in [§8](#8-what-changed-since-v1).
 
 ---
 
@@ -43,7 +49,7 @@ d["imu"].shape, d["reliability_scores"].shape, d["label_mask"].shape   # (N,6) (
 ### B. Re-run the whole pipeline (no bags needed)
 ```bash
 pip install -r requirements.txt
-bash run_all.sh          # ~45-60 min on a laptop CPU; most of that is the EKF runs
+bash run_all.sh          # ~1-1.5 h on a 20-core CPU (EKF runs are parallel); longer on a laptop
 ```
 `extracted/` already contains the arrays pulled from the bags, so this works straight from a clone.
 
@@ -64,26 +70,29 @@ bash run_all.sh          # ~45-60 min on a laptop CPU; most of that is the EKF r
 code/
   extract.py          bag -> extracted/*.npz (IMU, joints, feet)
   common.py           loading, interpolation, sequence lists, train/test split
-  calib.py            LIO-frame <-> Spot body-frame calibration (rotation, offset, time offset)
-  labels.py           per-foot reliability labels from LIO
+  calib.py            LIO-frame <-> Spot body-frame calibration (rotation, offset, time offset) + feet timing
+  reference.py        fused LIO + IMU body reference used by the labels
+  labels.py           per-foot reliability labels (current: fused reference, 0.1 s window; legacy v1 kept)
+  label_quality.py    legacy vs current labels: noise floor + known-answer test with synthetic slips
   features.py         35 per-foot features + labels on the IMU time grid -> features/*.npz
   export_dataset.py   team-format files -> dataset/*.npz
   models.py           heuristic, MLP, LSTM-MLP: training + score files
   foothold_filter.py  Project 2b foothold EKF, UNCHANGED
-  run_ekf.py          replays a sequence through the EKF (mirrors Project 2b real_replay.py), with per-foot noise
+  run_ekf.py          replays a sequence through the EKF (continuous or Project 2b touchdown-only updates), per-foot noise
+  tune_ekf.py         picks the continuous-update settings on the training sequences
   metrics.py          ATE / RPE / drift against LIO
   experiment.py       timing-offset set + oracle sweep of the noise scale on training data
   eval_ekf.py         runs every method x noise scale x sequence x timing offset
   analyze.py          picks noise scale on training data, writes tables + bar chart
   fig_labels.py       label figures
-  synth.py            synthetic-slip experiment (unfinished, see §8)
+  synth.py            synthetic-slip experiment B (injected slips, exact labels)
 extracted/            raw arrays from the 6 bags (~36 MB)
 gt/                   Co-RaL LIO reference trajectories (TUM format, 10 Hz), from the Co-RaL repo (MIT)
 dataset/              team-format per-sequence files + README
 results/              calibration, model weights, raw EKF metrics (JSON), summary tables
 figures/              plots
 ```
-`features/`, `results/scores/` and EKF trajectories are regenerated by the pipeline and git-ignored.
+`features/`, `features_synth/`, `results/scores*/` and EKF trajectories are regenerated by the pipeline and git-ignored.
 
 ---
 
@@ -107,7 +116,7 @@ Building also contains stairs, so this tests **new environments**, not never-see
 
 ---
 
-## 4. Calibration and timing (`calib.py`, `labels.py`)
+## 4. Calibration and timing (`calib.py`)
 
 The LIO poses aren't documented as being in any particular frame, so we estimated the relationship from the data.
 
@@ -115,38 +124,60 @@ The LIO poses aren't documented as being in any particular frame, so we estimate
 |---|---|---|
 | Rotation, LIO frame → body | Match angular rates from consecutive LIO poses to the IMU gyro (Kabsch / SVD fit) | < 1° (frames are essentially aligned) |
 | Time offset, LIO vs IMU | Repeat the rotation fit at offsets −0.2…+0.2 s and keep the best fit | **+0.06 s** (LIO stamps lag the IMU header stamps) |
-| Body-origin offset | Require stance feet to stay still in the world: a linear least-squares problem, made robust to outliers | (−0.12, 0.00, +0.15) m. The z part is poorly determined (mostly yaw motion), but labels are insensitive to it (checked: changing z by 15 cm changes median label displacement by 0.03 cm) |
-| Feet/joint stream vs LIO | Scan the shift that minimizes stance-foot displacement | Feet and LIO share a clock; both are **0.06 s** behind the IMU stamps |
+| Body-origin offset | Require stance feet to stay still in the world: a linear least-squares problem, made robust to outliers | (−0.12, 0.00, +0.15) m. The z part is poorly determined, but labels are insensitive to it |
+| Feet/joint stream vs IMU | Scan the shift that minimizes planted-foot motion against the **fused** reference (§5) | **+0.005 s**: the feet stream is essentially on the IMU clock |
 
 The feet message has no header, so its timestamp is the bag **record time**, which jitters 3–30 ms. We drop duplicate messages and interpolate.
 
-**Important timing caveat.** Applying the measured +0.06 s shift *inside the EKF* made it **worse** on every training sequence. The EKF is also chaotic with respect to timing: a 20 ms change moves `under`'s ATE from 2.55 m to 0.78 m. So:
-- the EKF keeps **Project 2b's original timing** (no shift), and
-- **every EKF number is reported as mean ± std over 5 foot-timing offsets** (−40, −20, 0, +20, +40 ms), so luck from one timing doesn't masquerade as a method improvement.
+**Correction to v1.** v1 measured the feet shift against raw LIO and concluded "feet share LIO's clock (+0.06 s)". Against the
+fused reference the minimum is sharp and at +5 ms (`results/calib.json`, `feet_dt_scan`). This explains why applying +0.06 s
+inside the EKF made it worse: it was the wrong shift.
 
-Features and labels do use the +0.06 s shift, because they're compared against LIO.
+**Timing robustness.** The EKF is sensitive to the foot timing, so the EKF keeps Project 2b's timing (no shift, which is within
+5 ms of the measured value), and **every EKF number is mean ± std over 5 foot-timing offsets** (−40, −20, 0, +20, +40 ms).
+With continuous updates (§6.3) the RPE spread across offsets shrank (stair ±0.078 → ±0.027 m, trail ±0.032 → ±0.020 m).
 
 ---
 
-## 5. Labels (`labels.py`)
+## 5. Labels (`reference.py`, `labels.py`)
 
-**Definition.** For each 0.1 s LIO interval and each foot in contact for that **whole** interval:
+**Definition.** For each IMU step (100 Hz) and each foot in contact for the **whole** centred 0.1 s window around it:
 
 ```
-f_world(t) = T_world_LIO(t) · T_LIO_body · p_foot_body(t)
-d          = || f_world(t_{k+1}) − f_world(t_k) ||        # a planted foot should not move
-score      = exp(−d² / (2 · σ²)),   σ = 2 cm
+f_world(t) = p_body(t) + R_body(t) · p_foot_body(t)
+d          = || f_world(t + 0.05) − f_world(t − 0.05) ||     # a planted foot should not move
+score      = exp(−d² / (2 · σ²)),   σ = 2 cm  (20 cm/s scores 0.61)
 ```
+
+**The body pose is a fused LIO + IMU reference** (`reference.py`), a complementary filter:
+- velocity = LIO velocity below 1 Hz + IMU-integrated velocity above 1 Hz (zero-phase filters, so no lag);
+- attitude = gyro integration, with the gyro bias and slow drift pulled toward LIO;
+- position = integrated fused velocity.
+
+LIO is accurate over seconds but jitters at Spot's gait frequencies (body bounce ~3.6 Hz). The IMU is the opposite.
+Feet are on the IMU clock (+5 ms, §4).
 
 **Choices**
-- **Displacement, not velocity.** Getting velocity means differentiating 10 Hz poses, which is noisy. Displacement over one LIO step is cleaner, and it's literally what a slip is.
-- **σ = 2 cm.** This is about the 75th percentile of training-set stance displacement. A typical contact scores about 0.8; the worst 1% score below about 0.1.
-- **Whole-interval stance only.** Intervals containing touchdown or liftoff get no label (`label_mask = False`).
+- **Displacement over 0.1 s, not velocity.** It is literally what a slip is, and 0.1 s averages out sensor noise.
+- **Whole-window stance only.** Windows containing touchdown or liftoff get no label (`label_mask = False`).
+- **σ = 2 cm** is unchanged from v1, and the same as the synthetic labels.
 
-**What we found**
-- The distribution is **one hump with a weak tail** (`figures/label_histogram_real.png`). The median "planted-foot motion" is **1.3 cm per 0.1 s**.
-- That is mostly LIO noise, not slip. Spot rarely slips on this data, and with a trot only 2 feet are down, so foot-specific slip can't be separated from reference jitter.
-- **This turned out to be the limiting factor of the project** (see §7).
+**How good are the labels?** (`label_quality.py` → `results/label_quality.json`)
+
+| | v1: LIO only, feet +0.06 s | v2: fused, feet +5 ms |
+|---|---|---|
+| Median apparent motion of a planted foot per 0.1 s | 1.30 cm | **0.89 cm** |
+| Clean steps scored < 0.5 (false alarms) | 14% | **2.8%** |
+| Injected slips > 2 cm caught (score < 0.5) | 95% | 95% |
+| AUC, slip > 2 cm vs not / corr. with true slip motion | 0.967 / 0.77 | **0.993 / 0.89** |
+
+The second half of the table uses the synthetic slips of §8, injected into real data, so the right answer is known.
+v2 cuts false alarms 5× without missing slips (`figures/label_histogram_real.png`; the spike at 0 is the robot standing still).
+
+**What is left.** A ~1 cm wobble, mostly sideways, that the planted feet share (pair correlation 0.92). A real slip
+is one foot, so this is still reference error, or foot/leg compliance. We tested load, joint motion, lever arm and
+gait phase as explanations; none explains more than 12% of it. Spot rarely slips on this data, so **real labels are
+mostly ≈ 1 with few true events**.
 
 ---
 
@@ -177,23 +208,28 @@ Foot position comes from Spot's own `foot_position_rt_body`, the same signal the
 - **Identical features for the MLP and LSTM.** Any gap between them comes from memory over time, which is the hypothesis being tested, not from extra inputs.
 - **One model shared across all 4 legs, with leg ID as an input.** This gives 4× the data.
 - **Swing feet get score 1.0.** The EKF re-initializes each foothold at touchdown anyway.
+- **Experiment B trains the same three models from scratch on the synthetic labels** (`EXP=synth python models.py`), with joint features zeroed.
 - Seeds are fixed (`torch.manual_seed(0)`). We ran a single training seed, so treat small label-metric gaps (MLP vs LSTM) as indicative.
 
-### 6.3 Using the score in the EKF (`run_ekf.py`)
+### 6.3 Using the score in the EKF (`run_ekf.py`, `tune_ekf.py`)
 - `foothold_filter.py` is the **unchanged Project 2b filter**. The state is 21-dimensional: body attitude, position, velocity, plus the 4 footholds' world positions.
-- The replay mirrors Project 2b's `real_replay.py`: every IMU sample is a predict step, and foot updates happen **only at swing→stance events**, where continuing feet are updated too. Height prior is **off** (it assumes z = 0, which is false on a sequence that climbs 15 m).
+- Every IMU sample is a predict step. Height prior is **off** (it assumes z = 0, which is false on a sequence that climbs 15 m).
+- **Foot updates, two modes:**
+  - *touchdown* = Project 2b's `real_replay.py`: updates only at swing→stance events (continuing feet are updated then too). A planted foot informs the filter at most once or twice per stance, in about 1/3 of stances never. This is the "Original EKF" row.
+  - *continuous* (default): the same events **plus an update of every planted foot at 25 Hz**, as leg-inertial EKFs are normally run. Settings were chosen on the training sequences only by a grid search (`tune_ekf.py` → `results/ekf_tuning.json`): 25 Hz, measurement σ 1 cm, σ_min 0.01.
+  - Why it matters here: with touchdown-only updates, a slipping foot barely touches the body estimate, so there was nothing for a reliability score to do.
 - **What the score changes:** each foot's **foothold random-walk noise**, via a log-linear mapping
 
   ```
-  σ_f,i = σ_min^(s_i) · σ_max^(1 − s_i),     σ_min = 1e-4  (Project 2b's value: a fully trusted foot)
+  σ_f,i = σ_min^(s_i) · σ_max^(1 − s_i),     σ_min = 0.01 (tuned: a fully trusted foot)
   ```
 
 - **Why the foothold noise rather than the measurement noise R:**
   - A slip is the foot *actually moving in the world*.
   - Inflating R only says "this reading is noisy", but the filter still believes the foot is fixed, so a slipping foot keeps dragging the body estimate.
   - Inflating the foothold noise says "this foot may be moving", so the foothold estimate absorbs the slip instead of the body.
-  - We also tried scaling R, and dropping low-score feet entirely. Both were worse (§7).
-- **σ_max is selected per method on the training sequences only.** Grid {0.01, 0.03, 0.1}, picking lowest training RPE. The test sequences are never used for any choice.
+  - In v1 we also tried scaling R, and dropping low-score feet entirely. Both were worse (`results/sigmax_sweep_legacy_touchdown.log`).
+- **σ_max is selected per method on the training sequences only.** Grid {0.03, 0.1, 0.3, 1}: lowest training RPE (experiment A) or lowest training slip damage (experiment B). The test sequences are never used for any choice.
 
 ### 6.4 Metrics (`metrics.py`)
 The LIO reference is converted to Spot's body frame and shifted onto the IMU clock first.
@@ -210,58 +246,87 @@ Everything is averaged over the 5 timing offsets (§4); the ± is the std across
 
 ## 7. Results and what they mean
 
-Full per-sequence tables: `results/summary_real.md`. Plots: `figures/`.
+Full per-sequence tables: `results/summary_real.md`, `results/summary_synth.md`. Short version with all tables: [`RESULTS.md`](RESULTS.md). Plots: `figures/`.
 
-**Label prediction (test sequences):** LSTM-MLP > MLP > heuristic on both sequences. **This part of the hypothesis holds.**
+### 7.1 Label prediction (test sequences)
+| r (MAE) | A real, stair | A real, trail | B synthetic, stair | B synthetic, trail |
+|---|---|---|---|---|
+| Heuristic | 0.24 (0.089) | 0.22 (0.094) | 0.25 (0.051) | 0.26 (0.053) |
+| MLP | 0.36 (0.090) | 0.26 (0.097) | 0.90 (0.016) | 0.89 (0.019) |
+| **LSTM-MLP** | **0.47 (0.082)** | **0.36 (0.091)** | **0.95 (0.011)** | **0.96 (0.013)** |
 
-**State estimation:** all methods match the original EKF to within ±0.01 on every metric, far inside the ±0.39 m timing spread. Feeding in the **true labels (oracle)** doesn't help either. Since perfect scores don't help, the learned ones can't, and the bottleneck isn't the networks. Three reasons:
+LSTM-MLP > MLP > heuristic everywhere. **This part of the hypothesis holds.** On real labels r is low because there are few
+real slip events left to predict (v1 had higher r; some of that was probably the networks predicting the reference jitter, which the v1 labels contained).
 
-1. **The labels are mostly reference noise** (§5). Down-weighting a "low-score" foot mostly throws away a good measurement.
-2. **The baseline error is heading drift, not slip.** Distance traveled per 10 m is accurate to about 1% (median length ratio 1.00–1.01), but yaw drifts (24° over building), and segment headings are off by a few degrees. Foot reliability affects leg odometry (distance), not yaw.
-3. On training data, every way of acting on the oracle labels made things slightly **worse**: larger foothold noise (σ_max up to 0.1), scaling R by up to 100×, and dropping feet with score < 0.5 (`results/sigmax_sweep.log`). With these labels, the best mapping is "don't scale".
+### 7.2 Experiment A: real data (test mean)
+| Method | ATE [m] | RPE /10 m [m] | Drift [%] |
+|---|---|---|---|
+| Original EKF (touchdown updates) | 1.53 ± 0.39 | 0.753 ± 0.231 | 2.44 ± 0.79 |
+| EKF, continuous updates | 1.48 ± 0.55 | **0.305 ± 0.024** | 2.23 ± 1.02 |
+| + Heuristic / MLP / LSTM-MLP | 1.46 | 0.304–0.307 | 2.19–2.20 |
+| + Oracle | 1.48 ± 0.57 | 0.306 ± 0.024 | 2.22 ± 1.03 |
 
-**How to say this in the report:** the hypothesis is **partly supported**. Temporal context (LSTM) improves reliability prediction. But on Co-RaL, LIO-derived labels don't carry enough slip signal to improve a foothold EKF whose error is dominated by heading drift. Showing that the oracle doesn't help either is what makes this a solid negative result rather than "our network didn't work".
+- Continuous updates cut RPE by 2.5× and halved stair drift (2.9 → 1.4%).
+- **No reliability method changes the EKF, and neither does the oracle.** The training sweep picks the smallest σ_max (0.03); larger values only hurt the oracle (train RPE 0.305 → 0.315 / 0.358 / 0.418 / 0.494 for σ_max 0.03 / 0.1 / 0.3 / 1). Perfect labels don't help, so the bottleneck isn't the networks; **there is very little slip to fix in this data.**
+- What error remains is mostly **heading (yaw) drift**, which foot contacts cannot observe. On trail, continuous updates improved RPE (0.53 → 0.30) but ATE got worse (1.37 → 1.93 m) because the max yaw error grew from 4.9° to 6.2°. A gyro-bias state in the EKF would be the next fix; it is out of scope here.
+
+### 7.3 Experiment B: synthetic slips (test mean)
+| Method | Slip damage RMS [m] | ATE [m] | RPE /10 m [m] |
+|---|---|---|---|
+| Original EKF (touchdown updates) | 2.58 ± 0.32 | 2.09 ± 0.35 | 0.887 ± 0.234 |
+| EKF, continuous updates | 3.21 ± 0.37 | 2.41 ± 0.39 | 0.610 ± 0.066 |
+| + Heuristic | 2.38 ± 0.41 | 2.11 ± 0.40 | 0.537 ± 0.052 |
+| + MLP | **0.62 ± 0.14** | 1.43 ± 0.51 | **0.343 ± 0.035** |
+| + LSTM-MLP | 0.63 ± 0.13 | **1.41 ± 0.51** | **0.343 ± 0.034** |
+| + Oracle | 0.61 ± 0.19 | 1.40 ± 0.54 | 0.345 ± 0.034 |
+
+- **When slips exist, learned reliability works:** slip damage drops 80% (3.2 → 0.6 m), and ~88% of the RPE lost to slips is recovered (clean-data RPE 0.305).
+- **The learned scores are as good as the oracle** for the EKF. The LSTM's better label prediction (0.95 vs 0.90) doesn't show up in the EKF; both are past the point where it matters.
+- **The heuristic barely helps.** A fixed formula on the consistency feature can't separate slips from normal stance variation well (r ≈ 0.25).
+- Continuous updates make the unprotected filter *more* sensitive to slips (2.6 → 3.2 m), since a slipping foot now drags the body all stance long. With learned reliability, the continuous filter beats the original by 4×.
+
+### 7.4 How to say this in the report
+The hypothesis is **supported where it can be tested**:
+- Temporal context (LSTM) gives the best reliability prediction, on real and synthetic labels.
+- Learned reliability removes most slip-induced error when slips are present, matching perfect labels.
+- On the real Co-RaL sequences there is too little slip for any reliability method, including the oracle, to help. That is a property of the data, shown by the oracle, not a failure of the networks.
 
 ---
 
-## 8. Unfinished: synthetic-slip experiment
+## 8. What changed since v1
 
-This is the proposal's fallback (`code/synth.py`), so that slips are known exactly.
+| | v1 | v2 (now) |
+|---|---|---|
+| EKF foot updates | touchdown only | continuous 25 Hz (tuned on train) |
+| Label reference | LIO only | fused LIO + IMU |
+| Feet timing | +0.06 s (assumed same clock as LIO) | +0.005 s (measured) |
+| Labels | per 10 Hz LIO interval | sliding 0.1 s window, 100 Hz |
+| Synthetic experiment | coded, not run | finished |
 
-**Design**
+**Corrections to v1 claims**
+- "Feet share LIO's clock" was wrong (see §4).
+- "The baseline error is heading drift" was only true for building in v1. With touchdown-only updates, leg odometry
+  itself was the main error; continuous updates fixed most of that, and *now* heading drift dominates what's left.
+- LIO timestamp jitter was not the main label noise; LIO's gait-band jitter and the wrong feet timing were.
+
+**Synthetic-slip design** (`synth.py`)
 - In 20% of stance phases, the foot slides **backward** (against the robot's heading ±30°, with up to 0.3 sink), 3–10 cm over 0.05–0.15 s, at a random point in the stance.
 - Only the measured foot position is corrupted: `p_meas = p_true + R_wbᵀ·Δ(t)`.
-- Labels: `exp(−(0.1 s · |dΔ/dt|)² / 2σ²)`.
+- Labels: `exp(−(0.1 s · |dΔ/dt|)² / 2σ²)`, slip speed *within* the stance (an earlier version also flagged the offset reset at liftoff, which only an LSTM could exploit; fixed).
 - Joint features are zeroed, because the corruption doesn't touch them and they would give the answer away.
-
-**What we learned before stopping**
-- **Random-direction slips mostly cancel.** The baseline EKF was barely affected, so we switched to backward (push-off) slips, which bias leg odometry consistently.
-- **ATE hides slip damage behind heading drift.** So the planned headline metric is **slip damage**: the RMS distance between the slipped run and the clean-data run of the same EKF, same timing offset. This isolates slip error from heading drift (implemented in `analyze.py`).
-- One-off check at offset 0:
-  - Slips pull the baseline **2.9 m (stair) / 2.3 m (trail) RMS** off the clean trajectory.
-  - Perfect labels cut that to **1.2 m / 0.7 m**.
-  - So, unlike the real labels, synthetic slips give the method something to fix.
-- **A label bug was found and fixed:** the slip offset resets at liftoff, which used to look like a slip in the last 50 ms of the stance. Only an LSTM can exploit that (it remembers the earlier slip), so it would have inflated the LSTM's advantage. Labels now use slip speed *within* the stance. **Models were not retrained after the fix, and no method comparison was run.**
-
-**To finish it**
-```bash
-cd code
-python eval_ekf.py real baseline            # clean-run trajectories needed for "slip damage" (if not already run)
-python synth.py                             # inject slips + labels -> features_synth/
-EXP=synth python models.py                  # train heuristic / MLP / LSTM on synthetic labels
-python eval_ekf.py synth baseline heuristic mlp lstm oracle
-python analyze.py synth                     # -> results/summary_synth.md, figures/ekf_metrics_synth.png
-```
-About 45–60 min on a laptop. `eval_ekf.py` can run in two terminals with different method lists to halve the time.
+- Random-direction slips mostly cancel and barely affect the EKF, hence backward (push-off) slips.
+- Headline metric **slip damage**: RMS distance between the slipped run and the clean-data run of the same filter at the same timing offset. This isolates slip error from heading drift.
 
 ---
 
 ## 9. Caveats
 
-- **LIO is a reference, not ground truth.** It is both the label source and the evaluation reference. That's acceptable for this project, but say so.
-- **The EKF is very timing-sensitive.** Always compare methods at the same offsets; don't trust single-run differences under ~0.4 m ATE.
+- **LIO is a reference, not ground truth.** It is (fused with the IMU) both the label source and the evaluation reference.
+- **The EKF is timing-sensitive.** Always compare methods at the same offsets; don't trust single-run differences.
+- **Synthetic slips only corrupt the reported foot position.** A real slip would also change the body dynamics and joint signals.
 - We used Spot's reported foot positions, not our own FK. Joint and feet streams are assumed to share a clock.
-- One training seed; the heuristic is fit to MSE; σ_max grid is coarse.
+- One training seed; the heuristic is fit to MSE; σ_max grid is coarse, and the heuristic hit its top (1.0) in experiment B.
+- The remaining ~1 cm shared label wobble (§5) is unexplained.
 
 ## 10. Credits
 - Co-RaL dataset and LIO reference: Jung, Yang & Kim, IROS 2024, https://github.com/SangwooJung98/Co-RaL-Dataset (MIT license). `gt/` files are copied unchanged from that repo.

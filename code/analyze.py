@@ -4,9 +4,9 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from common import *
 
-METHODS = ["baseline", "heuristic", "mlp", "lstm", "oracle"]
-NAMES = {"baseline": "Original EKF", "heuristic": "Heuristic", "mlp": "MLP", "lstm": "LSTM-MLP", "oracle": "Oracle labels"}
-COL = {"baseline": "#8a8984", "heuristic": "#2a78d6", "mlp": "#eb6834", "lstm": "#1baf7a", "oracle": "#eda100"}
+METHODS = ["baseline_td", "baseline", "heuristic", "mlp", "lstm", "oracle"]
+NAMES = {"baseline_td": "Original EKF (2b replay)", "baseline": "EKF, continuous updates", "heuristic": "Heuristic", "mlp": "MLP", "lstm": "LSTM-MLP", "oracle": "Oracle labels"}
+COL = {"baseline_td": "#c9c8c2", "baseline": "#8a8984", "heuristic": "#2a78d6", "mlp": "#eb6834", "lstm": "#1baf7a", "oracle": "#eda100"}
 INK, INK2, SURF = "#0b0b0b", "#52514e", "#fcfcfb"
 plt.rcParams.update({"font.size": 10, "axes.edgecolor": "#c9c8c2", "axes.labelcolor": INK2, "xtick.color": INK2,
                      "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False,
@@ -31,7 +31,8 @@ def add_damage(rows, exp):
     tr = ROOT / "results" / "ekf_synth" / "traj"; cl = ROOT / "results" / "ekf_real" / "traj"
     for r in rows:
         a = np.load(tr / f"{r['method']}_{r['seq']}_{r['sig_max']}_{r['offset']:+.2f}.npz")
-        b = np.load(cl / f"baseline_{r['seq']}_None_{r['offset']:+.2f}.npz")
+        clean = "baseline_td" if r["method"] == "baseline_td" else "baseline"     # same filter, clean data
+        b = np.load(cl / f"{clean}_{r['seq']}_None_{r['offset']:+.2f}.npz")
         n = min(len(a["P"]), len(b["P"]))
         dP = a["P"][:n] - b["P"][:n]
         r["damage"] = float(np.sqrt(np.mean(np.sum(dP ** 2, axis=1))))
@@ -41,7 +42,7 @@ def add_damage(rows, exp):
 
 def select_sigma(rows, m):
     """Pick sig_max for method m by mean RPE over the TRAIN sequences (test never used)."""
-    if m == "baseline":
+    if m.startswith("baseline"):
         return None
     sig = sorted({r["sig_max"] for r in rows if r["method"] == m})
     key = "damage" if "damage" in rows[0] else "RPE"

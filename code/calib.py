@@ -97,4 +97,19 @@ if __name__ == "__main__":
     R_sb = R_bs.T
     t_sb = solve_translation(TRAIN, R_sb)
     print("t_sb (body origin in sensor frame)", t_sb.round(4))
-    json.dump(dict(time_offset=float(off), R_sb=R_sb.tolist(), t_sb=t_sb.tolist()), open(ROOT / "results" / "calib.json", "w"), indent=1)
+    cal = dict(time_offset=float(off), R_sb=R_sb.tolist(), t_sb=t_sb.tolist())
+
+    # Feet/joint stream vs IMU clock. Shift that makes planted feet move least against the fused
+    # LIO+IMU reference (reference.py). The LIO-only reference cannot resolve this: at 10 Hz it smears the
+    # gait-band motion, which is exactly what a feet-timing error shows up in.
+    from labels import window_displacements
+    raw = {s: load_raw(s) for s in TRAIN}
+    scan = {}
+    for fdt in np.round(np.arange(-0.03, 0.0451, 0.005), 3):
+        scan[float(fdt)] = float(np.mean([np.nanmedian(np.linalg.norm(
+            window_displacements(raw[s], cal, "fused", foot_dt=fdt)[1], axis=2)) for s in TRAIN]))
+        print(f"feet shift {fdt:+.3f} s: median planted-foot motion {scan[float(fdt)]*100:.3f} cm / 0.1 s")
+    cal["feet_dt"] = min(scan, key=scan.get)
+    cal["feet_dt_scan"] = scan
+    print("feet/joint -> IMU clock shift", cal["feet_dt"])
+    json.dump(cal, open(ROOT / "results" / "calib.json", "w"), indent=1)

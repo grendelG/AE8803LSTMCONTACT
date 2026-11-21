@@ -1,8 +1,14 @@
 """Replay a sequence through the Project 2b foothold EKF, optionally with per-foot reliability scores.
 
-Replay logic mirrors project_2b/real_replay.py:
-- every IMU sample -> predict
-- foot updates are emitted only at swing->stance events (continuing feet updated then too)
+Every IMU sample -> predict. Two ways of feeding the feet (UPDATE_MODE):
+- "touchdown"  : exactly project_2b/real_replay.py. Foot updates happen only at swing->stance events
+                 (continuing feet are updated then too). A planted foot therefore gives body information
+                 at most once or twice per stance, and in ~1/3 of stances never.
+- "continuous" : the same events, PLUS an update of every planted foot whenever UPDATE_HZ worth of time
+                 has passed since the last update. This is how leg-inertial EKFs are normally run; a slipping
+                 foot now drags the body estimate continuously, so per-foot trust can actually matter.
+                 Settings (UPDATE_HZ, SIGMA_MEAS, SIG_MIN) were chosen on the training sequences only
+                 (tune_ekf.py -> results/ekf_tuning.json).
 Reliability scores scale each foot's foothold random-walk sigma (log-linear map):
     sigma_f,i = SIG_MIN^(s_i) * SIG_MAX^(1 - s_i)
 """
@@ -14,8 +20,27 @@ from foothold_filter import FootholdNavStateImuEKF
 from common import *
 
 CM = 0.01
-SIG_MIN = 1e-4          # Project 2b's foothold_process_sigma (fully trusted foot)
-FOOT_DT = 0.06
+FOOT_DT = 0.0           # feet stream shift in the replay; Project 2b timing. Calibrated feet->IMU shift is +5 ms,
+                        # i.e. ~0; evaluation perturbs it by -40..+40 ms (experiment.OFFSETS)
+# replay configuration; defaults = the tuned continuous replay (see tune_ekf.py)
+UPDATE_MODE = "continuous"
+UPDATE_HZ = 50.0
+SIGMA_MEAS = 1 * CM     # foot-position measurement noise
+SIG_MIN = 1e-4          # foothold random walk of a fully trusted foot (Project 2b's foothold_process_sigma)
+TOUCHDOWN_CFG = dict(UPDATE_MODE="touchdown", SIGMA_MEAS=1 * CM, SIG_MIN=1e-4)   # original Project 2b replay
+_tuned = ROOT / "results" / "ekf_tuning.json"
+if _tuned.exists():
+    _c = json.load(open(_tuned))["chosen"]
+    UPDATE_HZ, SIGMA_MEAS, SIG_MIN = _c["UPDATE_HZ"], _c["SIGMA_MEAS"], _c["SIG_MIN"]
+CONTINUOUS_CFG = dict(UPDATE_MODE="continuous", UPDATE_HZ=UPDATE_HZ, SIGMA_MEAS=SIGMA_MEAS, SIG_MIN=SIG_MIN)  # the default
+
+
+def configure(**kw):
+    """Set module-level replay settings, e.g. configure(**TOUCHDOWN_CFG). Returns the previous values.
+    Settings persist in the process: callers that reuse processes (multiprocessing pools) must set them per job."""
+    g = globals(); old = {k: g[k] for k in kw}
+    g.update(kw)
+    return old
 
 
 class ReliabilityEKF(FootholdNavStateImuEKF):
@@ -46,7 +71,7 @@ def make_ekf():
     x0 = gtsam.NavState(gtsam.Rot3(), np.zeros(3), np.zeros(3))
     P0 = np.diag(np.concatenate([[1e-2, 1e-2, 1e-6], [0.05] * 3, [0.05] * 3, [0.08] * 12]))
     return ReliabilityEKF(x0=x0, P0=P0, num_feet=4, foot_names=FEET, sigma_gyro=8e-4, sigma_acc=1e-2,
-                          foothold_process_sigma=SIG_MIN, sigma_meas=1 * CM, sigma_height_prior=15 * CM)
+                          foothold_process_sigma=SIG_MIN, sigma_meas=SIGMA_MEAS, sigma_height_prior=15 * CM)
 
 
 def weighted_contact_update(ekf, old, new, r_scale, gate):
@@ -102,7 +127,9 @@ def run(seq, scores=None, sig_max=None, fix_timing=True, height_prior=False, mod
             if prev is not None and has_imu:
                 start = cur & ~prev
                 cont = cur & prev
-                if start.any() and not (last_emit is not None and abs(tt - last_emit) < 1e-12):
+                due = (UPDATE_MODE == "continuous" and cont.any()
+                       and (last_emit is None or tt - last_emit >= 1.0 / UPDATE_HZ - 1e-9))
+                if (start.any() or due) and not (last_emit is not None and abs(tt - last_emit) < 1e-12):
                     step(tt)
                     old = {FEET[i]: pf[k, i].copy() for i in range(4) if cont[i]}
                     new = {FEET[i]: pf[k, i].copy() for i in range(4) if start[i]}

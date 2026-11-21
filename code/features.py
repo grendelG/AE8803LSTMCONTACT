@@ -1,15 +1,15 @@
 """Build per-foot, IMU-rate feature tensors and reliability labels for every sequence.
 
-Clock convention (from calib.py / labels.py): reference poses and the feet/joint
-streams are shifted by +FOOT_DT onto the IMU clock.
+Clock convention (calib.py): the feet/joint streams are shifted by FOOT_DT = calib "feet_dt" (about +5 ms)
+onto the IMU clock; LIO poses by calib "time_offset" (+0.06 s). Labels: labels.window_displacements.
 """
 import numpy as np, json
 from common import *
-from labels import stance_displacements
+from labels import window_displacements
 
 CAL = json.load(open(ROOT / "results" / "calib.json"))
-FOOT_DT = 0.06          # feet/joint streams -> IMU clock (found by label scan)
-SIGMA_LABEL = 0.02      # m per 0.1 s; ~75th pct of training stance displacement
+FOOT_DT = CAL.get("feet_dt", 0.06)   # feet/joint streams -> IMU clock (calib.py)
+SIGMA_LABEL = 0.02      # m per 0.1 s (a planted foot moving 20 cm/s is clearly slipping); same as synth labels
 DIFF_LAG = 3            # samples (30 ms) for causal finite differences
 
 FEATURE_NAMES = (["contact", "t_since_td", "n_stance"] + [f"p_{a}" for a in "xyz"] + [f"pdot_{a}" for a in "xyz"]
@@ -63,12 +63,9 @@ def build(seq):
             np.linalg.norm(dev[:, i], axis=1), qj[:, i], dqj[:, i], tauj[:, i], w, d["acc"],
             np.tile(np.eye(4)[i], (N, 1))])
 
-    # labels on the IMU grid
-    t0, t1, D = stance_displacements(d, CAL, foot_dt=FOOT_DT)
-    k = np.searchsorted(t0, t, side="right") - 1
-    valid = (k >= 0) & (k < len(t0)) & (t < t1[np.clip(k, 0, len(t1) - 1)])
-    disp = np.full((N, 4), np.nan)
-    disp[valid] = D[k[valid]]
+    # labels on the IMU grid: foot displacement over a centred 0.1 s window, fused LIO+IMU body motion
+    _, D = window_displacements(d, CAL, "fused", foot_dt=FOOT_DT)
+    disp = np.linalg.norm(D, axis=2)
     disp[~st] = np.nan
     y = np.exp(-disp ** 2 / (2 * SIGMA_LABEL ** 2))
     return dict(t=t, X=X, y=y.astype(np.float32), disp=disp, contact=contact, pfoot_imu=p,

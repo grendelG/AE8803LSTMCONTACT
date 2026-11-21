@@ -11,8 +11,10 @@ Keys / shapes:
   lio_pose            (N, 7)  [x, y, z, qx, qy, qz, qw] LIO reference, already in Spot's body frame
   reliability_scores  (N, 4)  float in [0, 1]; 1.0 wherever there is no label (swing / partial stance)
   label_mask          (N, 4)  bool, True where reliability_scores is a real label (use for training loss)
-Feet / joint / LIO streams were shifted by +0.06 s onto the IMU clock (see results/calib.json) and
-interpolated (zero-order hold for contact).
+Feet / joint streams were shifted onto the IMU clock by calib "feet_dt" (about +5 ms) and LIO poses by calib
+"time_offset" (+0.06 s), see results/calib.json; then interpolated (zero-order hold for contact).
+reliability_scores: foot displacement over a centred 0.1 s window, body motion from the fused LIO+IMU
+reference (code/reference.py), score = exp(-d^2 / (2 * 0.02^2)).
 """
 import numpy as np
 from scipy.spatial.transform import Slerp

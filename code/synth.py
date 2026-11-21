@@ -58,9 +58,11 @@ def inject(d, seed):
     return out, delta, events
 
 
-def build_synth(seq, seed, foot_dt=0.0):
+def build_synth(seq, seed, foot_dt=None):
     """Features (same definition as features.py, joints zeroed) + exact labels for an injected copy."""
     import features
+    if foot_dt is None:
+        foot_dt = features.FOOT_DT
     d0 = load_raw(seq)
     d, delta, ev = inject(d0, seed)
     orig = features.load_raw
